@@ -2,16 +2,19 @@ from flask import Flask, render_template, request, redirect, url_for, session
 import pdfplumber
 import os
 import re
+import json
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-here-change-in-production'
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['DATA_FOLDER'] = 'data'  # Store questions here
 
-# Create upload folder if it doesn't exist
-if not os.path.exists(app.config['UPLOAD_FOLDER']):
-    os.makedirs(app.config['UPLOAD_FOLDER'])
+# Create folders if they don't exist
+for folder in [app.config['UPLOAD_FOLDER'], app.config['DATA_FOLDER']]:
+    if not os.path.exists(folder):
+        os.makedirs(folder)
 
 ALLOWED_EXTENSIONS = {'pdf'}
 
@@ -35,7 +38,7 @@ def extract_questions_from_pdf(pdf_path):
             
             # Split by common question patterns
             # This pattern looks for: "1.", "Q1.", "Question 1:", etc.
-            question_pattern = r'(?:^|\n)(?:Q\.?\s*\d+|Question\s*\d+|\d+\.)'
+            question_pattern = r'(?:^|\n)(?:\d+\.|Q\.|Q\s*\d+\.|Question\s*\d+:)[^\n]*'
             
             parts = re.split(question_pattern, full_text)
             
@@ -44,7 +47,8 @@ def extract_questions_from_pdf(pdf_path):
                 if part.strip():
                     questions.append({
                         'id': i,
-                        'question': part.strip()[:500]  # Limit to 500 chars per question
+                        'text': part.strip()[:500],  # Limit to 500 chars per question
+                        'options': []  # Add option parsing if needed
                     })
     
     except Exception as e:
@@ -53,9 +57,23 @@ def extract_questions_from_pdf(pdf_path):
     
     return questions
 
+def save_questions_to_file(session_id, questions):
+    """Save questions to a JSON file instead of session"""
+    filepath = os.path.join(app.config['DATA_FOLDER'], f'{session_id}.json')
+    with open(filepath, 'w') as f:
+        json.dump(questions, f)
+
+def load_questions_from_file(session_id):
+    """Load questions from JSON file"""
+    filepath = os.path.join(app.config['DATA_FOLDER'], f'{session_id}.json')
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            return json.load(f)
+    return None
+
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template('upload.html')
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -75,10 +93,17 @@ def upload_file():
         # Extract questions
         questions = extract_questions_from_pdf(filepath)
         
-        # Store in session
-        session['questions'] = questions
+        # Generate unique session ID
+        import uuid
+        session_id = str(uuid.uuid4())
+        
+        # Store questions in file instead of session
+        save_questions_to_file(session_id, questions)
+        
+        # Store only the session ID and metadata in session
+        session['session_id'] = session_id
         session['current_question'] = 0
-        session['exam_duration'] = int(request.form.get('duration', 60))  # Default 60 minutes
+        session['exam_duration'] = int(request.form.get('timer', 60))  # Default 60 minutes
         
         return redirect(url_for('exam'))
     
@@ -86,25 +111,30 @@ def upload_file():
 
 @app.route('/exam')
 def exam():
-    questions = session.get('questions', [])
-    current_idx = session.get('current_question', 0)
-    duration = session.get('exam_duration', 60)
+    session_id = session.get('session_id')
+    if not session_id:
+        return redirect(url_for('index'))
     
+    questions = load_questions_from_file(session_id)
     if not questions:
         return redirect(url_for('index'))
     
-    return render_template('exam.html', 
-                         question=questions[current_idx] if current_idx < len(questions) else None,
+    current_idx = session.get('current_question', 0)
+    duration = session.get('exam_duration', 60)
+    
+    return render_template('exam.html',
+                         questions=questions,
                          current=current_idx + 1,
                          total=len(questions),
                          duration=duration)
 
 @app.route('/next')
 def next_question():
+    session_id = session.get('session_id')
     current = session.get('current_question', 0)
-    questions = session.get('questions', [])
     
-    if current < len(questions) - 1:
+    questions = load_questions_from_file(session_id)
+    if questions and current < len(questions) - 1:
         session['current_question'] = current + 1
     
     return redirect(url_for('exam'))
@@ -118,11 +148,18 @@ def previous_question():
     
     return redirect(url_for('exam'))
 
-@app.route('/finish')
+@app.route('/submit', methods=['POST'])
 def finish_exam():
-    # Clear session
+    # Clear session data
+    session_id = session.get('session_id')
+    if session_id:
+        # Optionally delete the questions file
+        filepath = os.path.join(app.config['DATA_FOLDER'], f'{session_id}.json')
+        if os.path.exists(filepath):
+            os.remove(filepath)
+    
     session.clear()
-    return render_template('finish.html')
+    return redirect(url_for('index'))
 
 if __name__ == '__main__':
     app.run(debug=True)
