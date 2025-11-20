@@ -24,7 +24,7 @@ def allowed_file(filename):
 def extract_questions_from_pdf(pdf_path):
     """
     Extract questions from PDF file - IMPROVED for Government Exam PDFs.
-    Handles formats like SSC CGL, IBPS PO, CHSL, etc.
+    Handles formats like SSC CGL, IBPS PO, CHSL exams.
     """
     questions = []
     
@@ -32,115 +32,164 @@ def extract_questions_from_pdf(pdf_path):
         with pdfplumber.open(pdf_path) as pdf:
             full_text = ""
             for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    full_text += text + "\n"
+                full_text += page.extract_text() + "\n"
             
-            # Multiple question patterns for government exams
-            # Pattern 1: Q.1, Q.2, Q.3... (Most common)
-            # Pattern 2: Q1., Q2., Q3...
-            # Pattern 3: Question 1, Question 2...
-            question_patterns = [
-                r'Q\.\d+',  # Matches Q.1, Q.2, Q.3
-                r'Q\d+\.',  # Matches Q1., Q2., Q3.
-                r'Question\s+\d+',  # Matches Question 1, Question 2
+            # Multiple patterns to detect different question formats
+            # Pattern 1: Q.1, Q.2, Q.3 (SSC CGL/CHSL style)
+            # Pattern 2: Q1., Q2., Q3. (IBPS style) 
+            # Pattern 3: Question followed by number
+            patterns = [
+                r'Q\.(\d+)\s+(.*?)(?=Q\.\d+|Ans\s*\d+|$)',
+                r'Q(\d+)\.\s+(.*?)(?=Q\d+\.|Ans\s*\d+|$)',
+                r'Question\s+(\d+)(?:.*?\n)(.*?)(?=Question\s+\d+|Ans|$)'
             ]
             
-            # Try each pattern
-            for pattern in question_patterns:
-                matches = list(re.finditer(pattern, full_text, re.IGNORECASE))
-                if len(matches) > 5:  # If we found at least 5 questions, use this pattern
+            for pattern in patterns:
+                matches = re.findall(pattern, full_text, re.DOTALL)
+                if matches and len(matches) > 0:
+                    print(f"Found {len(matches)} questions with pattern: {pattern}")
                     break
             
             if not matches:
-                # Fallback: Split by newlines and create questions
-                lines = [line.strip() for line in full_text.split('\n') if line.strip()]
-                for i, line in enumerate(lines[:100]):  # Limit to first 100 lines
-                    if len(line) > 10:  # Only meaningful lines
-                        questions.append({
-                            'id': i + 1,
-                            'text': line[:800],  # Limit to 800 chars
-                            'options': []
-                        })
-                return questions[:50]  # Return max 50 questions
+                # Fallback: Try to extract by splitting on common patterns
+                questions = extract_by_splitting(full_text)
+                return questions[:100]  # Limit to 100 questions
             
-            # Extract questions based on found pattern
-            for i in range(len(matches)):
-                question_start = matches[i].end()
-                question_end = matches[i+1].start() if i+1 < len(matches) else len(full_text)
-                
-                question_text = full_text[question_start:question_end].strip()
-                
-                # Clean up question text
-                question_text = re.sub(r'\s+', ' ', question_text)  # Remove extra spaces
-                question_text = re.sub(r'[\n\r]+', ' ', question_text)  # Remove newlines
-                
-                # Extract options (Ans 1., Ans 2., etc. OR just 1., 2., 3., 4.)
-                options = []
-                option_pattern = r'(?:Ans\s+)?(\d+)\.\s*([^\d]{1,200}?)(?=(?:Ans\s+)?\d+\.|$)'
-                option_matches = re.findall(option_pattern, question_text[:1000])
-                
-                if option_matches:
-                    options = [opt[1].strip() for opt in option_matches[:4]]  # Max 4 options
-                    # Remove options from question text
-                    for opt in option_matches:
-                        question_text = question_text.replace(f"{opt[0]}. {opt[1]}", "")
-                        question_text = question_text.replace(f"Ans {opt[0]}. {opt[1]}", "")
-                
-                # Limit question length
-                if len(question_text) > 800:
-                    question_text = question_text[:800] + "..."
-                
-                if question_text.strip():  # Only add non-empty questions
-                    questions.append({
-                        'id': i + 1,
-                        'text': question_text.strip(),
-                        'options': options
-                    })
-                
-                # Limit to 100 questions max
-                if len(questions) >= 100:
-                    break
-    
+            for match in matches:
+                if len(match) == 2:
+                    q_num, content = match
+                    
+                    # Clean up the content
+                    content = content.strip()
+                    
+                    # Extract question text and options
+                    # Look for "Ans" keyword to separate question from options
+                    ans_match = re.search(r'(.*?)\s*Ans\s*[:\s]*(.*)', content, re.DOTALL)
+                    
+                    if ans_match:
+                        question_text = ans_match.group(1).strip()
+                        options_text = ans_match.group(2).strip()
+                    else:
+                        # If no "Ans" keyword, treat first part as question
+                        parts = content.split('\n', 1)
+                        question_text = parts[0].strip()
+                        options_text = parts[1].strip() if len(parts) > 1 else ""
+                    
+                    # Extract options (Ans 1., Ans 2., etc. or 1., 2., 3., 4.)
+                    options = []
+                    option_patterns = [
+                        r'Ans\s*(\d+)[\.:)]\s*([^\n\d]+(?:\n(?!Ans\s*\d)[^\n]+)*)',
+                        r'(\d+)[\.:)]\s*([^\n\d]+(?:\n(?!\d+[\.:)])[^\n]+)*)'
+                    ]
+                    
+                    for opt_pattern in option_patterns:
+                        option_matches = re.findall(opt_pattern, options_text)
+                        if option_matches and len(option_matches) >= 3:
+                            options = [opt[1].strip().replace('\n', ' ') for opt in option_matches]
+                            break
+                    
+                    # Only add if we have valid question and at least 2 options
+                    if question_text and len(question_text) > 10 and len(options) >= 2:
+                        # Limit question text to reasonable length
+                        if len(question_text) > 800:
+                            question_text = question_text[:800] + "..."
+                        
+                        questions.append({
+                            'question': question_text,
+                            'options': options[:4]  # Maximum 4 options
+                        })
+                        
+                        # Limit to 100 questions
+                        if len(questions) >= 100:
+                            break
+        
+        if not questions:
+            return [{
+                'question': 'No questions could be extracted from this PDF. Please ensure the PDF contains text (not images) and follows standard question format.',
+                'options': ['Try another PDF', 'Check PDF format', 'Contact support', 'Go back']
+            }]
+        
+        return questions
+        
     except Exception as e:
-        print(f"Error extracting questions: {e}")
-        # Return a sample question in case of error
+        print(f"Error extracting questions: {str(e)}")
         return [{
-            'id': 1,
-            'text': f"Error reading PDF: {str(e)}. Please try a different PDF or check the format.",
-            'options': []
+            'question': f'Error processing PDF: {str(e)}',
+            'options': ['Try again', 'Upload different file', 'Check file format', 'Go back']
         }]
+
+def extract_by_splitting(text):
+    """
+    Fallback method: Extract by splitting on patterns
+    """
+    questions = []
     
-    return questions if questions else [{
-        'id': 1,
-        'text': 'No questions found in PDF. The PDF format might not be supported. Please try a text-based PDF.',
-        'options': []
-    }]
+    # Split by common section markers
+    lines = text.split('\n')
+    current_question = None
+    current_options = []
+    
+    for line in lines:
+        line = line.strip()
+        
+        # Check if this is a question line
+        if re.match(r'^Q\.?\s*\d+', line) or re.match(r'^Question\s+\d+', line):
+            # Save previous question if exists
+            if current_question and current_options:
+                questions.append({
+                    'question': current_question,
+                    'options': current_options[:4]
+                })
+            
+            # Start new question
+            current_question = re.sub(r'^Q\.?\s*\d+\s*', '', line)
+            current_options = []
+        
+        # Check if this is an option line
+        elif re.match(r'^[1-4][\.:)]', line) or re.match(r'^Ans\s*[1-4]', line):
+            option_text = re.sub(r'^(?:Ans\s*)?[1-4][\.:)]\s*', '', line)
+            if option_text:
+                current_options.append(option_text)
+        
+        # Continuation of question or option
+        elif current_question and not current_options:
+            current_question += " " + line
+    
+    # Add last question
+    if current_question and current_options:
+        questions.append({
+            'question': current_question,
+            'options': current_options[:4]
+        })
+    
+    return questions
 
 def save_questions_to_file(session_id, questions):
-    """Save questions to a JSON file instead of session"""
-    filepath = os.path.join(app.config['DATA_FOLDER'], f'{session_id}.json')
+    """Save questions to a JSON file"""
+    filepath = os.path.join(app.config['DATA_FOLDER'], f"{session_id}.json")
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(questions, f, ensure_ascii=False, indent=2)
 
 def load_questions_from_file(session_id):
-    """Load questions from JSON file"""
-    filepath = os.path.join(app.config['DATA_FOLDER'], f'{session_id}.json')
-    if os.path.exists(filepath):
+    """Load questions from a JSON file"""
+    filepath = os.path.join(app.config['DATA_FOLDER'], f"{session_id}.json")
+    try:
         with open(filepath, 'r', encoding='utf-8') as f:
             return json.load(f)
-    return None
+    except FileNotFoundError:
+        return None
 
 @app.route('/')
 def index():
     return render_template('upload.html')
 
 @app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files:
+def upload():
+    if 'pdf' not in request.files:
         return redirect(url_for('index'))
     
-    file = request.files['file']
+    file = request.files['pdf']
+    duration = request.form.get('duration', 30)
     
     if file.filename == '':
         return redirect(url_for('index'))
@@ -153,17 +202,21 @@ def upload_file():
         # Extract questions
         questions = extract_questions_from_pdf(filepath)
         
-        # Generate unique session ID
+        # Generate session ID and save questions
         import uuid
         session_id = str(uuid.uuid4())
-        
-        # Store questions in file instead of session
         save_questions_to_file(session_id, questions)
         
-        # Store only the session ID and metadata in session
+        # Store minimal data in session
         session['session_id'] = session_id
         session['current_question'] = 0
-        session['exam_duration'] = int(request.form.get('timer', 60))  # Default 60 minutes
+        session['duration'] = int(duration)
+        
+        # Clean up uploaded file
+        try:
+            os.remove(filepath)
+        except:
+            pass
         
         return redirect(url_for('exam'))
     
@@ -171,36 +224,47 @@ def upload_file():
 
 @app.route('/exam')
 def exam():
-    session_id = session.get('session_id')
-    if not session_id:
+    if 'session_id' not in session:
         return redirect(url_for('index'))
     
+    session_id = session['session_id']
     questions = load_questions_from_file(session_id)
+    
     if not questions:
         return redirect(url_for('index'))
     
-    current_idx = session.get('current_question', 0)
-    duration = session.get('exam_duration', 60)
+    current = session.get('current_question', 0)
+    duration = session.get('duration', 30)
     
-    return render_template('exam.html',
-                         questions=questions,
-                         current=current_idx + 1,
-                         total=len(questions),
+    return render_template('exam.html', 
+                         question=questions[current],
+                         question_num=current + 1,
+                         total_questions=len(questions),
                          duration=duration)
 
-@app.route('/next')
+@app.route('/next', methods=['POST'])
 def next_question():
-    session_id = session.get('session_id')
+    if 'session_id' not in session:
+        return redirect(url_for('index'))
+    
+    session_id = session['session_id']
+    questions = load_questions_from_file(session_id)
+    
+    if not questions:
+        return redirect(url_for('index'))
+    
     current = session.get('current_question', 0)
     
-    questions = load_questions_from_file(session_id)
-    if questions and current < len(questions) - 1:
+    if current < len(questions) - 1:
         session['current_question'] = current + 1
     
     return redirect(url_for('exam'))
 
-@app.route('/previous')
+@app.route('/previous', methods=['POST'])
 def previous_question():
+    if 'session_id' not in session:
+        return redirect(url_for('index'))
+    
     current = session.get('current_question', 0)
     
     if current > 0:
@@ -209,14 +273,15 @@ def previous_question():
     return redirect(url_for('exam'))
 
 @app.route('/submit', methods=['POST'])
-def finish_exam():
-    # Clear session data
-    session_id = session.get('session_id')
-    if session_id:
-        # Optionally delete the questions file
-        filepath = os.path.join(app.config['DATA_FOLDER'], f'{session_id}.json')
-        if os.path.exists(filepath):
+def submit():
+    # Clean up session data
+    if 'session_id' in session:
+        session_id = session['session_id']
+        filepath = os.path.join(app.config['DATA_FOLDER'], f"{session_id}.json")
+        try:
             os.remove(filepath)
+        except:
+            pass
     
     session.clear()
     return redirect(url_for('index'))
