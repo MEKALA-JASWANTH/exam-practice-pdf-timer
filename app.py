@@ -3,6 +3,7 @@ import pdfplumber
 import os
 import re
 import json
+import time
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -35,9 +36,6 @@ def extract_questions_from_pdf(pdf_path):
                 full_text += page.extract_text() + "\n"
             
             # Multiple patterns to detect different question formats
-            # Pattern 1: Q.1, Q.2, Q.3 (SSC CGL/CHSL style)
-            # Pattern 2: Q1., Q2., Q3. (IBPS style) 
-            # Pattern 3: Question followed by number
             patterns = [
                 r'Q\.(\d+)\s+(.*?)(?=Q\.\d+|Ans\s*\d+|$)',
                 r'Q(\d+)\.\s+(.*?)(?=Q\d+\.|Ans\s*\d+|$)',
@@ -51,31 +49,24 @@ def extract_questions_from_pdf(pdf_path):
                     break
             
             if not matches:
-                # Fallback: Try to extract by splitting on common patterns
                 questions = extract_by_splitting(full_text)
-                return questions[:100]  # Limit to 100 questions
+                return questions[:100]
             
             for match in matches:
                 if len(match) == 2:
                     q_num, content = match
-                    
-                    # Clean up the content
                     content = content.strip()
                     
-                    # Extract question text and options
-                    # Look for "Ans" keyword to separate question from options
                     ans_match = re.search(r'(.*?)\s*Ans\s*[:\s]*(.*)', content, re.DOTALL)
                     
                     if ans_match:
                         question_text = ans_match.group(1).strip()
                         options_text = ans_match.group(2).strip()
                     else:
-                        # If no "Ans" keyword, treat first part as question
                         parts = content.split('\n', 1)
                         question_text = parts[0].strip()
                         options_text = parts[1].strip() if len(parts) > 1 else ""
                     
-                    # Extract options (Ans 1., Ans 2., etc. or 1., 2., 3., 4.)
                     options = []
                     option_patterns = [
                         r'Ans\s*(\d+)[\.:)]\s*([^\n\d]+(?:\n(?!Ans\s*\d)[^\n]+)*)',
@@ -88,18 +79,15 @@ def extract_questions_from_pdf(pdf_path):
                             options = [opt[1].strip().replace('\n', ' ') for opt in option_matches]
                             break
                     
-                    # Only add if we have valid question and at least 2 options
                     if question_text and len(question_text) > 10 and len(options) >= 2:
-                        # Limit question text to reasonable length
                         if len(question_text) > 800:
                             question_text = question_text[:800] + "..."
                         
                         questions.append({
                             'question': question_text,
-                            'options': options[:4]  # Maximum 4 options
+                            'options': options[:4]
                         })
                         
-                        # Limit to 100 questions
                         if len(questions) >= 100:
                             break
         
@@ -119,12 +107,7 @@ def extract_questions_from_pdf(pdf_path):
         }]
 
 def extract_by_splitting(text):
-    """
-    Fallback method: Extract by splitting on patterns
-    """
     questions = []
-    
-    # Split by common section markers
     lines = text.split('\n')
     current_question = None
     current_options = []
@@ -132,30 +115,24 @@ def extract_by_splitting(text):
     for line in lines:
         line = line.strip()
         
-        # Check if this is a question line
         if re.match(r'^Q\.?\s*\d+', line) or re.match(r'^Question\s+\d+', line):
-            # Save previous question if exists
             if current_question and current_options:
                 questions.append({
                     'question': current_question,
                     'options': current_options[:4]
                 })
             
-            # Start new question
             current_question = re.sub(r'^Q\.?\s*\d+\s*', '', line)
             current_options = []
         
-        # Check if this is an option line
         elif re.match(r'^[1-4][\.:)]', line) or re.match(r'^Ans\s*[1-4]', line):
             option_text = re.sub(r'^(?:Ans\s*)?[1-4][\.:)]\s*', '', line)
             if option_text:
                 current_options.append(option_text)
         
-        # Continuation of question or option
         elif current_question and not current_options:
             current_question += " " + line
     
-    # Add last question
     if current_question and current_options:
         questions.append({
             'question': current_question,
@@ -165,13 +142,11 @@ def extract_by_splitting(text):
     return questions
 
 def save_questions_to_file(session_id, questions):
-    """Save questions to a JSON file"""
     filepath = os.path.join(app.config['DATA_FOLDER'], f"{session_id}.json")
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(questions, f, ensure_ascii=False, indent=2)
 
 def load_questions_from_file(session_id):
-    """Load questions from a JSON file"""
     filepath = os.path.join(app.config['DATA_FOLDER'], f"{session_id}.json")
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -199,20 +174,18 @@ def upload():
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
         
-        # Extract questions
         questions = extract_questions_from_pdf(filepath)
         
-        # Generate session ID and save questions
         import uuid
         session_id = str(uuid.uuid4())
         save_questions_to_file(session_id, questions)
         
-        # Store minimal data in session
         session['session_id'] = session_id
         session['current_question'] = 0
         session['duration'] = int(duration)
+        session['answers'] = {}  # Store user answers
+        session['start_time'] = time.time()
         
-        # Clean up uploaded file
         try:
             os.remove(filepath)
         except:
@@ -242,6 +215,22 @@ def exam():
                          total_questions=len(questions),
                          duration=duration)
 
+@app.route('/answer', methods=['POST'])
+def answer():
+    if 'session_id' not in session:
+        return redirect(url_for('index'))
+    
+    current = session.get('current_question', 0)
+    selected_answer = request.form.get('answer')
+    
+    if selected_answer:
+        if 'answers' not in session:
+            session['answers'] = {}
+        session['answers'][str(current)] = selected_answer
+        session.modified = True
+    
+    return redirect(url_for('exam'))
+
 @app.route('/next', methods=['POST'])
 def next_question():
     if 'session_id' not in session:
@@ -254,6 +243,13 @@ def next_question():
         return redirect(url_for('index'))
     
     current = session.get('current_question', 0)
+    selected_answer = request.form.get('answer')
+    
+    if selected_answer:
+        if 'answers' not in session:
+            session['answers'] = {}
+        session['answers'][str(current)] = selected_answer
+        session.modified = True
     
     if current < len(questions) - 1:
         session['current_question'] = current + 1
@@ -274,17 +270,67 @@ def previous_question():
 
 @app.route('/submit', methods=['POST'])
 def submit():
-    # Clean up session data
-    if 'session_id' in session:
-        session_id = session['session_id']
-        filepath = os.path.join(app.config['DATA_FOLDER'], f"{session_id}.json")
-        try:
-            os.remove(filepath)
-        except:
-            pass
+    if 'session_id' not in session:
+        return redirect(url_for('index'))
     
-    session.clear()
-    return redirect(url_for('index'))
+    session_id = session['session_id']
+    questions = load_questions_from_file(session_id)
+    
+    if not questions:
+        return redirect(url_for('index'))
+    
+    current = session.get('current_question', 0)
+    selected_answer = request.form.get('answer')
+    
+    if selected_answer:
+        if 'answers' not in session:
+            session['answers'] = {}
+        session['answers'][str(current)] = selected_answer
+        session.modified = True
+    
+    answers = session.get('answers', {})
+    total_questions = len(questions)
+    answered = len(answers)
+    unanswered = total_questions - answered
+    
+    start_time = session.get('start_time', time.time())
+    time_taken = int(time.time() - start_time)
+    minutes = time_taken // 60
+    seconds = time_taken % 60
+    
+    session['total_questions'] = total_questions
+    session['answered'] = answered
+    session['unanswered'] = unanswered
+    session['time_taken'] = f"{minutes}m {seconds}s"
+    
+    filepath = os.path.join(app.config['DATA_FOLDER'], f"{session_id}.json")
+    try:
+        os.remove(filepath)
+    except:
+        pass
+    
+    return redirect(url_for('results'))
+
+@app.route('/results')
+def results():
+    if 'session_id' not in session:
+        return redirect(url_for('index'))
+    
+    total = session.get('total_questions', 0)
+    answered = session.get('answered', 0)
+    unanswered = session.get('unanswered', 0)
+    time_taken = session.get('time_taken', '0m 0s')
+    
+    session.pop('session_id', None)
+    session.pop('current_question', None)
+    session.pop('answers', None)
+    session.pop('start_time', None)
+    
+    return render_template('results.html',
+                         total_questions=total,
+                         answered=answered,
+                         unanswered=unanswered,
+                         time_taken=time_taken)
 
 if __name__ == '__main__':
     app.run(debug=True)
